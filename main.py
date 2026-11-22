@@ -241,8 +241,11 @@ def resolve_single_link(browser, item, proxy_pool=None, current_proxy=None, time
                     proxy_pool.report_success(proxy_to_use)
                 break
             else:
+                # "Shortener incomplete" = site blocked datacenter IP, NOT proxy failure
+                # Only report actual connection errors as proxy failures
                 if proxy_pool and hasattr(proxy_pool, "report_failure") and proxy_to_use:
-                    proxy_pool.report_failure(proxy_to_use, "Shortener incomplete")
+                    # Don't discard proxy for shortener-side blocking
+                    pass
                 current_proxy = None  # Discard sticky proxy on failure
                 if attempt < max_attempts:
                     safe_print(f"[{idx}/{total}] ⚠️ Proxy failed. Switching to next proxy from pool...")
@@ -323,8 +326,8 @@ def process_links(urls, proxies=None, concurrency=2, timeout_sec=30, output_file
         active_file = os.path.join(SCRIPT_DIR, "proxies.txt")
         proxy_pool = DynamicProxyPool(
             initial_proxies=proxies,
-            min_threshold=max(min_proxies, 30),
-            target_size=max(200, len(proxies)),
+            min_threshold=min(max(min_proxies, 10), len(proxies)),
+            target_size=len(proxies),
             raw_file=raw_file,
             active_file=active_file
         )

@@ -194,7 +194,7 @@ class DynamicProxyPool:
       5. Auto-scrapes from live feeds if local archives are depleted.
     """
     def __init__(self, initial_proxies=None, min_threshold=8, target_size=20,
-                 raw_file=None, active_file=None, max_failures=1):
+                 raw_file=None, active_file=None, max_failures=3):
         self.lock = threading.Lock()
         self.active_proxies = collections.deque(initial_proxies or [])
         self.failures = collections.defaultdict(int)
