@@ -211,16 +211,10 @@ class OUOTUI:
             self.processed_links += total
             self.status = f"Round {self.current_round} complete"
 
-        # Parse individual link results
-        if "👉 Final Destination:" in line:
-            self.success_count += 1
-            self.processed_links += 1
-        elif "❌ Could not resolve destination" in line:
-            self.fail_count += 1
-            self.processed_links += 1
-        elif "EXPIRED / DELETED" in line:
+        # Per-link: track expired only. Success/fail/processed are updated from
+        # the "ROUND COMPLETE" summary below - counting both would double them.
+        if "Status: EXPIRED / DELETED" in line:
             self.expired_count += 1
-            self.processed_links += 1
 
         # Parse proxy pool size updates
         pool_match = re.search(r"Active proxies remaining in pool:\s*(\d+)", line)
@@ -250,8 +244,8 @@ class OUOTUI:
         self.add_log(f"Starting resolver: {rounds} rounds, concurrency={concurrency}", "success")
 
         try:
-            # Build command
-            cmd = [sys.executable, "main.py", "--once", "-c", str(concurrency)]
+            # Build command (-u = unbuffered so logs stream in real-time)
+            cmd = [sys.executable, "-u", "main.py", "-c", str(concurrency)]
             if rounds > 1:
                 cmd.extend(["--rounds", str(rounds)])
 
@@ -284,8 +278,7 @@ class OUOTUI:
             self.add_log(f"Error: {e}", "error")
         finally:
             self.worker_proc = None
-            self.total_rounds = 0
-            self.current_round = 0
+            self.status = "Complete" if self.running else "Stopped"
 
     def scrape_proxies_subprocess(self):
         """Worker: fetch proxies via subprocess"""
@@ -293,7 +286,7 @@ class OUOTUI:
         self.add_log("Scraping proxies from hide.mn...", "warning")
 
         try:
-            cmd = [sys.executable, "main.py", "--fetch-proxies"]
+            cmd = [sys.executable, "-u", "main.py", "--fetch-proxies"]
             self.worker_proc = subprocess.Popen(
                 cmd,
                 cwd=SCRIPT_DIR,
@@ -342,27 +335,34 @@ class OUOTUI:
 
     # ---------- Input Threads ----------
     def input_thread(self):
-        """Background thread: read menu choice via console.input()"""
+        """Single stdin reader: menu choice AND round prompts happen here, so
+        two threads can never race for the same input line."""
         while self.running:
             try:
-                choice = console.input("\n[bold bright_cyan]Select (1-4, Q):[/bold bright_cyan] ").strip()
-                self.menu_choice = choice.upper()
+                choice = console.input("\n[bold bright_cyan]Select (1-4, Q):[/bold bright_cyan] ").strip().upper()
             except (EOFError, KeyboardInterrupt):
                 self.menu_choice = "Q"
                 break
             except Exception:
                 time.sleep(0.1)
+                continue
 
-    def rounds_prompt_thread(self):
-        """Background thread: prompt for rounds count and concurrency"""
-        try:
-            rounds = IntPrompt.ask("\n[bold]How many rounds?[/bold]", default=1)
-            if rounds > 0:
-                concurrency = IntPrompt.ask("[bold]Concurrency (1-4)?[/bold]", default=2)
-                concurrency = max(1, min(concurrency, 4))
-                self.rounds_input = (rounds, concurrency)
-        except Exception:
-            self.rounds_input = None
+            if choice == "1":
+                try:
+                    rounds = IntPrompt.ask("[bold]How many rounds?[/bold]", default=1)
+                    if rounds > 0:
+                        concurrency = IntPrompt.ask("[bold]Concurrency (1-4)?[/bold]", default=2)
+                        concurrency = max(1, min(concurrency, 4))
+                        self.rounds_input = (rounds, concurrency)
+                        self.menu_choice = "1"
+                except (EOFError, KeyboardInterrupt):
+                    self.menu_choice = "Q"
+                    break
+                except Exception:
+                    self.rounds_input = None
+                continue
+
+            self.menu_choice = choice
 
     # ---------- Main Loop ----------
     def handle_choice(self, choice: str):
@@ -372,16 +372,14 @@ class OUOTUI:
             if self.worker_proc:
                 self.worker_proc.terminate()
                 self.worker_proc = None
-            
-            # Prompt for rounds and concurrency
-            t = threading.Thread(target=self.rounds_prompt_thread, daemon=True)
-            t.start()
-            t.join(timeout=30)
+
+            # Rounds/concurrency were already collected by input_thread
+            # (no second stdin reader, no 30s UI freeze).
             if self.rounds_input:
                 rounds, concurrency = self.rounds_input
                 self.worker_thread = threading.Thread(
-                    target=self.run_resolver_subprocess, 
-                    args=(rounds, concurrency), 
+                    target=self.run_resolver_subprocess,
+                    args=(rounds, concurrency),
                     daemon=True
                 )
                 self.worker_thread.start()

@@ -13,10 +13,15 @@ Features:
 import sys
 import os
 
-# Auto-add user site-packages for playwright (works without run.sh wrapper)
-USER_SITE = os.path.expanduser("~/.local/lib/python3.14/site-packages")
-if os.path.isdir(USER_SITE) and USER_SITE not in sys.path:
-    sys.path.insert(0, USER_SITE)
+# Auto-add the CURRENT interpreter's user site-packages (works without the
+# run.sh wrapper). Hard-coding "python3.14" broke every other Python version.
+try:
+    import site
+    _USER_SITE = site.getusersitepackages()
+    if _USER_SITE and os.path.isdir(_USER_SITE) and _USER_SITE not in sys.path:
+        sys.path.insert(0, _USER_SITE)
+except Exception:
+    pass
 
 import time
 import random
@@ -29,8 +34,8 @@ from playwright.sync_api import sync_playwright
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-from stealth import apply_stealth, STEALTH_CHROMIUM_ARGS, DEFAULT_USER_AGENT, DEFAULT_VIEWPORT, generate_device_profile
-from solvers import universal_resolve, is_shortener
+from stealth import apply_stealth, STEALTH_CHROMIUM_ARGS, generate_device_profile
+from solvers import universal_resolve, is_shortener, proxy_url_with_auth
 try:
     from proxy_manager import scrape_and_validate_proxies, fetch_all_raw_proxies, test_proxy, DynamicProxyPool
 except ImportError:
@@ -42,6 +47,8 @@ except ImportError:
 print_lock = threading.Lock()
 
 def safe_print(*args, **kwargs):
+    # flush so TUI/subprocess consumers see lines immediately (no pipe buffering)
+    kwargs.setdefault("flush", True)
     with print_lock:
         print(*args, **kwargs)
 
@@ -261,66 +268,61 @@ def resolve_single_link(browser, item, proxy_list=None, timeout_sec=30,
                 except Exception:
                     pass
 
-    # Try proxies one by one with lazy validation
-    if proxy_list and test_proxy:
-        # Check if using DynamicProxyPool
-        if DynamicProxyPool and isinstance(proxy_list, DynamicProxyPool):
-            # Use DynamicProxyPool's get_proxy() which validates internally
-            proxy = proxy_list.get_proxy()
-            if proxy:
-                server = proxy.get("server", "")
-                safe_print(f"[{idx}/{total}] 🛡️  Using validated proxy: {proxy['display']}")
-                final_destination, working_proxy = run_with_proxy(proxy)
-                if final_destination:
-                    return final_destination, working_proxy
-                safe_print(f"[{idx}/{total}] ⚠️ Proxy worked but resolution failed, trying next...")
-                proxy_list.report_failure(proxy, "resolution failed")
-                # Try next proxy from pool
-                proxy = proxy_list.get_proxy()
-                while proxy:
-                    safe_print(f"[{idx}/{total}] 🛡️  Using validated proxy: {proxy['display']}")
-                    final_destination, working_proxy = run_with_proxy(proxy)
-                    if final_destination:
-                        return final_destination, working_proxy
-                    safe_print(f"[{idx}/{total}] ⚠️ Proxy worked but resolution failed, trying next...")
-                    proxy_list.report_failure(proxy, "resolution failed")
-                    proxy = proxy_list.get_proxy()
-            else:
-                safe_print(f"[{idx}/{total}] ⚠️ No working proxies in pool")
+    def build_result(final_destination):
+        """ALWAYS returns the result dict. Callers must never get a bare URL."""
+        if final_destination == "[EXPIRED / DELETED LINK]":
+            status = "EXPIRED"
+            safe_print(f"[{idx}/{total}] ⚠️ Status: EXPIRED / DELETED (No longer active on OUO)\n")
+        elif final_destination and not is_shortener(final_destination):
+            status = "SUCCESS"
+            safe_print(f"[{idx}/{total}] 👉 Final Destination: {final_destination}\n")
         else:
-            # Old logic for raw proxy list
+            status = "FAILED"
+            safe_print(f"[{idx}/{total}] ❌ Could not resolve destination.\n")
+        return {
+            "index": idx,
+            "input_url": raw_url,
+            "destination": final_destination,
+            "status": status
+        }
+
+    def try_proxy(proxy):
+        """Run one proxy attempt. Returns (result_dict|None, proxy)."""
+        if not proxy:
+            return None, None
+        destination, working_proxy = run_with_proxy(proxy)
+        if destination:
+            if DynamicProxyPool and isinstance(proxy_list, DynamicProxyPool):
+                proxy_list.report_success(proxy)
+            return build_result(destination), working_proxy
+        if DynamicProxyPool and isinstance(proxy_list, DynamicProxyPool):
+            proxy_list.report_failure(proxy, "resolution failed")
+        return None, None
+
+    # Try proxies one by one (bounded, so a bad pool can never loop forever)
+    if proxy_list and test_proxy:
+        if DynamicProxyPool and isinstance(proxy_list, DynamicProxyPool):
+            for _ in range(5):
+                proxy = proxy_list.get_proxy()
+                if not proxy:
+                    break
+                result, _wp = try_proxy(proxy)
+                if result:
+                    return result, None
+        else:
             for proxy in proxy_list:
                 server = proxy.get("server", "")
                 safe_print(f"[{idx}/{total}] 🔎 Testing proxy: {server}")
-                if test_proxy(server):
-                    safe_print(f"[{idx}/{total}] ✅ Proxy validated, using it")
-                    final_destination, working_proxy = run_with_proxy(proxy)
-                    if final_destination:
-                        return final_destination, working_proxy
-                    safe_print(f"[{idx}/{total}] ⚠️ Proxy worked but resolution failed, trying next...")
-                else:
+                if not test_proxy(server):
                     safe_print(f"[{idx}/{total}] ❌ Proxy dead, trying next...")
+                    continue
+                safe_print(f"[{idx}/{total}] ✅ Proxy validated, using it")
+                result, _wp = try_proxy(proxy)
+                if result:
+                    return result, None
 
     # No working proxy found, try direct
-    final_destination = run_direct_fallback()
-
-    status = "FAILED"
-    if final_destination == "[EXPIRED / DELETED LINK]":
-        status = "EXPIRED"
-        safe_print(f"[{idx}/{total}] ⚠️ Status: EXPIRED / DELETED (No longer active on OUO)\n")
-    elif final_destination and not is_shortener(final_destination):
-        status = "SUCCESS"
-        safe_print(f"[{idx}/{total}] 👉 Final Destination: {final_destination}\n")
-    else:
-        status = "FAILED"
-        safe_print(f"[{idx}/{total}] ❌ Could not resolve destination.\n")
-
-    return {
-        "index": idx,
-        "input_url": raw_url,
-        "destination": final_destination,
-        "status": status
-    }, None
+    return build_result(run_direct_fallback()), None
 
 def worker_batch_task(batch_items, proxy_list, timeout_sec, device_type="auto", dwell_sec=0):
     """
@@ -346,7 +348,7 @@ def worker_batch_task(batch_items, proxy_list, timeout_sec, device_type="auto", 
     return results
 
 def process_links(urls, proxies=None, concurrency=2, timeout_sec=30, output_file=None,
-                  clean_input_file=None, loop=False, rounds=1, delay_sec=5, min_proxies=5,
+                  clean_input_file=None, loop=False, rounds=1, delay_sec=5,
                   device_type="auto", dwell_sec=0):
     total = len(urls)
     concurrency = max(1, min(concurrency, 4))
@@ -483,6 +485,18 @@ def process_links(urls, proxies=None, concurrency=2, timeout_sec=30, output_file
     print(f"  ⏱️ Total Session Time:      {total_elapsed}s")
     print("=" * 60 + "\n")
 
+def resolve_run_mode(once, rounds, loop):
+    """Single source of truth for run mode.
+    --once wins, then --loop, then --rounds; otherwise one single round."""
+    if once:
+        return False, 1
+    if loop:
+        return True, 1
+    if rounds is not None:
+        return False, max(1, rounds)
+    return False, 1
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="link",
@@ -604,27 +618,27 @@ Usage Examples:
 
     if args.save_proxies and proxies:
         save_path = os.path.join(SCRIPT_DIR, "proxies.txt")
+
+        def write_proxy(pf, pr):
+            # Preserve credentials - writing only ["server"] produced unusable
+            # entries for authenticated proxies.
+            url = proxy_url_with_auth(pr) or pr.get("server", "")
+            if url:
+                pf.write(f"{url}\n")
+
         with open(save_path, "w", encoding="utf-8") as pf:
             if DynamicProxyPool and isinstance(proxies, DynamicProxyPool):
                 # Get all active proxies from pool
                 active = list(proxies.active_proxies)
                 for pr in active:
-                    pf.write(f"{pr['server']}\n")
+                    write_proxy(pf, pr)
                 print(f"💾 Saved {len(active)} validated proxies to: {save_path}\n")
             elif isinstance(proxies, list):
                 for pr in proxies:
-                    pf.write(f"{pr['server']}\n")
+                    write_proxy(pf, pr)
                 print(f"💾 Saved {len(proxies)} validated proxies to: {save_path}\n")
 
-    if args.once:
-        is_loop = False
-        rounds_count = 1
-    elif args.rounds:
-        is_loop = False
-        rounds_count = args.rounds
-    else:
-        is_loop = True
-        rounds_count = 1
+    is_loop, rounds_count = resolve_run_mode(args.once, args.rounds, args.loop)
 
     process_links(
         urls,
@@ -636,7 +650,6 @@ Usage Examples:
         loop=is_loop,
         rounds=rounds_count,
         delay_sec=args.delay,
-        min_proxies=args.min_proxies,
         device_type=args.device,
         dwell_sec=args.dwell
     )

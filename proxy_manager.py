@@ -144,10 +144,12 @@ def test_proxy(proxy_str: str, test_url: str = "https://ouo.press", timeout: int
     )
     try:
         with opener.open(req, timeout=timeout) as resp:
-            if resp.status == 200:
-                body = resp.read(500).decode("utf-8", errors="ignore")
-                if "Just a moment" not in body:
-                    return raw
+            # Any real HTTP response proves the tunnel works. Cloudflare-protected
+            # targets answer 403/503; that does NOT mean the proxy is dead.
+            return raw
+    except urllib.error.HTTPError:
+        # We DID get an HTTP response through the proxy (e.g. 403) -> alive.
+        return raw
     except Exception:
         return None
     return None
@@ -189,7 +191,7 @@ class DynamicProxyPool:
     Thread-safe dynamic proxy pool that:
       1. Rotates valid proxies round-robin across concurrent workers.
       2. Continuously maintains 15-25 live verified proxies in the background.
-      3. Discards failing proxies immediately (max_failures=1) and replaces them.
+      3. Discards failing proxies once they hit max_failures and replaces them.
       4. Cycles through all raw archive candidates without re-testing dead ones.
       5. Auto-scrapes from live feeds if local archives are depleted.
     """
@@ -208,9 +210,8 @@ class DynamicProxyPool:
         self.candidate_index = 0
         self.raw_candidates = []
 
-        self._load_raw_candidates()
-
-        # If pool size is below target, start background refill immediately
+        # Do NOT scrape synchronously here - that used to block startup for
+        # ~1-2 minutes. The background refill thread loads candidates lazily.
         if len(self.active_proxies) < self.target_size:
             self.is_refilling = True
             threading.Thread(target=self._background_refill, daemon=True).start()
@@ -247,40 +248,51 @@ class DynamicProxyPool:
     def get_proxy(self):
         """
         Retrieves the next healthy proxy and rotates it to the end of queue.
-        Validates each proxy before returning - if dead, removes and tries next.
-        Triggers auto-refill if pool drops below threshold.
+        Validation (network I/O) happens OUTSIDE the lock so concurrent workers
+        are not serialized behind one slow proxy check.
         """
-        should_refill = False
-        with self.lock:
-            while self.active_proxies:
-                p = self.active_proxies[0]
-                self.active_proxies.rotate(-1)
-                server = p.get("server", "")
-                # Validate before returning
-                if self.validate_proxy(server):
-                    if len(self.active_proxies) < self.min_threshold and not self.is_refilling:
-                        self.is_refilling = True
-                        should_refill = True
-                    if should_refill:
-                        threading.Thread(target=self._background_refill, daemon=True).start()
-                    return p
+        while True:
+            start_refill = False
+            with self.lock:
+                if self.active_proxies:
+                    p = self.active_proxies[0]
+                    self.active_proxies.rotate(-1)
                 else:
-                    # Dead proxy - remove from pool
-                    self.active_proxies = collections.deque(
-                        x for x in self.active_proxies if x.get("server") != server
-                    )
-                    print(f"⚠️ [Proxy Dead] {p.get('display', server)} removed from pool")
-            
-            # No proxies left
-            if not self.is_refilling:
-                self.is_refilling = True
-                should_refill = True
-            p = None
+                    p = None
+                    if not self.is_refilling:
+                        self.is_refilling = True
+                        start_refill = True
 
-        if should_refill:
-            threading.Thread(target=self._background_refill, daemon=True).start()
+            if p is None:
+                if start_refill:
+                    threading.Thread(target=self._background_refill, daemon=True).start()
+                return None
 
-        return p
+            server = p.get("server", "")
+
+            # --- network check outside the lock ---
+            if self.validate_proxy(server):
+                with self.lock:
+                    low = (len(self.active_proxies) < self.min_threshold
+                           and not self.is_refilling)
+                    if low:
+                        self.is_refilling = True
+                if low:
+                    threading.Thread(target=self._background_refill, daemon=True).start()
+                return p
+
+            # Dead proxy - drop it from the pool (outside the lock for I/O fairness)
+            with self.lock:
+                self.active_proxies = collections.deque(
+                    x for x in self.active_proxies if x.get("server") != server
+                )
+                if (len(self.active_proxies) < self.min_threshold
+                        and not self.is_refilling):
+                    self.is_refilling = True
+                    start_refill = True
+            print(f"⚠️ [Proxy Dead] {p.get('display', server)} removed from pool")
+            if start_refill:
+                threading.Thread(target=self._background_refill, daemon=True).start()
 
     def report_success(self, proxy_dict):
         """
@@ -329,10 +341,17 @@ class DynamicProxyPool:
         try:
             print(f"\n🔄 [Auto-Refill] Active proxies below target ({self.size()}/{self.target_size}). Harvesting & validating fresh proxies...")
             batch_size = 50
+            if not self.raw_candidates:
+                self._load_raw_candidates()
+            refetch_count = 0
 
             while self.size() < self.target_size:
                 if self.candidate_index >= len(self.raw_candidates):
+                    # Avoid an endless scrape-refetch loop when nothing validates.
+                    if refetch_count >= 2:
+                        break
                     self._load_raw_candidates()
+                    refetch_count += 1
                     if not self.raw_candidates:
                         break
 
@@ -356,6 +375,7 @@ class DynamicProxyPool:
                             print(f"   🎯 [Auto-Refill] Verified fresh proxy: {clean}")
 
                 if newly_verified:
+                    refetch_count = 0
                     with self.lock:
                         for p in newly_verified:
                             if not any(x.get("server") == p.get("server") for x in self.active_proxies):
