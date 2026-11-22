@@ -12,6 +12,12 @@ Features:
 
 import sys
 import os
+
+# Auto-add user site-packages for playwright (works without run.sh wrapper)
+USER_SITE = os.path.expanduser("~/.local/lib/python3.14/site-packages")
+if os.path.isdir(USER_SITE) and USER_SITE not in sys.path:
+    sys.path.insert(0, USER_SITE)
+
 import time
 import random
 import argparse
@@ -598,4 +604,13 @@ Usage Examples:
     )
 
 if __name__ == "__main__":
-    main()
+    # Launch TUI if no arguments provided
+    if len(sys.argv) == 1:
+        try:
+            from tui import main as tui_main
+            tui_main()
+        except ImportError:
+            print("❌ TUI not available (rich not installed)")
+            sys.exit(1)
+    else:
+        main()
