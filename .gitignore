@@ -2,3 +2,6 @@ node_modules/
 .next/
 .env*
 next-env.d.ts
+
+# Added by ML AI Code: build output and caches
+*.tsbuildinfo

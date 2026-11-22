@@ -2,8 +2,11 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Conversation, Message } from "@/db/schema";
+import type { ProviderInfo } from "@/lib/model";
 
 type StreamState = "idle" | "streaming" | "error";
+
+const PROVIDER_STORAGE_KEY = "open.provider";
 
 export default function Home() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -14,7 +17,31 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [loadingThread, setLoadingThread] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [providerId, setProviderId] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/providers")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { providers: ProviderInfo[]; defaultProvider: string } | null) => {
+        if (cancelled || !data) return;
+        setProviders(data.providers);
+        const saved = window.localStorage.getItem(PROVIDER_STORAGE_KEY);
+        const known = data.providers.some((p) => p.id === saved);
+        setProviderId(known && saved ? saved : data.defaultProvider);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  function chooseProvider(id: string) {
+    setProviderId(id);
+    window.localStorage.setItem(PROVIDER_STORAGE_KEY, id);
+  }
 
   const refreshConversations = useCallback(async () => {
     const res = await fetch("/api/conversations");
@@ -96,7 +123,11 @@ export default function Home() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId: convId, content: text }),
+        body: JSON.stringify({
+          conversationId: convId,
+          content: text,
+          provider: providerId || undefined,
+        }),
       });
 
       if (!res.ok || !res.body) {
@@ -191,6 +222,25 @@ export default function Home() {
         {error && (
           <div className="error-banner" role="alert">
             {error}
+          </div>
+        )}
+
+        {providers.length > 0 && (
+          <div className="provider-row">
+            <label htmlFor="provider">Provider</label>
+            <select
+              id="provider"
+              value={providerId}
+              onChange={(e) => chooseProvider(e.target.value)}
+              disabled={status === "streaming"}
+            >
+              {providers.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label} · {p.model}
+                  {p.configured ? "" : " (no key)"}
+                </option>
+              ))}
+            </select>
           </div>
         )}
 

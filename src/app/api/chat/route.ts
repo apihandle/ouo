@@ -2,12 +2,18 @@ import { NextRequest } from "next/server";
 import { asc, eq } from "drizzle-orm";
 import { db } from "@/db";
 import { conversations, messages } from "@/db/schema";
-import { MODEL_BASE_URL, MODEL_NAME, hasModelKey } from "@/lib/model";
+import {
+  buildChatRequest,
+  defaultProviderId,
+  extractDelta,
+  getProvider,
+  type ChatTurn,
+} from "@/lib/model";
 
 export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
-  let body: { conversationId?: string; content?: string };
+  let body: { conversationId?: string; content?: string; provider?: string };
   try {
     body = await req.json();
   } catch {
@@ -22,6 +28,16 @@ export async function POST(req: NextRequest) {
     !content.trim()
   ) {
     return new Response(JSON.stringify({ error: "conversationId and content are required" }), {
+      status: 400,
+    });
+  }
+
+  if (body.provider !== undefined && typeof body.provider !== "string") {
+    return new Response(JSON.stringify({ error: "provider must be a string" }), { status: 400 });
+  }
+  const provider = getProvider(body.provider ?? defaultProviderId());
+  if (!provider) {
+    return new Response(JSON.stringify({ error: `Unknown provider: ${body.provider}` }), {
       status: 400,
     });
   }
@@ -58,38 +74,42 @@ export async function POST(req: NextRequest) {
       .where(eq(conversations.id, conversationId));
   }
 
-  if (!hasModelKey()) {
+  if (!provider.apiKey) {
     return new Response(
       JSON.stringify({
-        error:
-          "No model API key configured. Set OPENAI_API_KEY in Vault (Preview scope) and retry.",
+        error: `No API key configured for ${provider.label}. Set ${provider.keyEnv} in Vault (Preview scope) and retry.`,
       }),
       { status: 503, headers: { "content-type": "application/json" } },
     );
   }
 
-  const upstream = await fetch(`${MODEL_BASE_URL}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: MODEL_NAME,
-      stream: true,
-      messages: history.map((m) => ({ role: m.role, content: m.content })),
-    }),
-  });
+  // Stored "system" rows are local failure markers, not prompts.
+  const turns: ChatTurn[] = history
+    .filter((m) => m.role === "user" || m.role === "assistant")
+    .map((m) => ({ role: m.role as ChatTurn["role"], content: m.content }));
+
+  const { url, init } = buildChatRequest(provider, turns);
+  let upstream: Response;
+  try {
+    upstream = await fetch(url, init);
+  } catch {
+    return new Response(
+      JSON.stringify({ error: `Could not reach ${provider.label} at ${provider.baseUrl}.` }),
+      { status: 502 },
+    );
+  }
 
   if (!upstream.ok || !upstream.body) {
     const detail = await upstream.text().catch(() => "");
     await db.insert(messages).values({
       conversationId,
       role: "system",
-      content: `Model request failed (${upstream.status}).`,
+      content: `${provider.label} request failed (${upstream.status}).`,
     });
     return new Response(
-      JSON.stringify({ error: `Model request failed: ${upstream.status} ${detail.slice(0, 300)}` }),
+      JSON.stringify({
+        error: `${provider.label} request failed: ${upstream.status} ${detail.slice(0, 300)}`,
+      }),
       { status: 502 },
     );
   }
@@ -100,6 +120,7 @@ export async function POST(req: NextRequest) {
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      let failure: Error | null = null;
       try {
         const reader = upstream.body!.getReader();
         let buffer = "";
@@ -114,18 +135,31 @@ export async function POST(req: NextRequest) {
             if (!trimmed.startsWith("data:")) continue;
             const data = trimmed.slice(5).trim();
             if (data === "[DONE]") continue;
+            let parsed: unknown;
             try {
-              const parsed = JSON.parse(data);
-              const delta = parsed?.choices?.[0]?.delta?.content;
-              if (typeof delta === "string" && delta) {
-                full += delta;
-                controller.enqueue(encoder.encode(delta));
-              }
+              parsed = JSON.parse(data);
             } catch {
               // ignore malformed keep-alive chunks
+              continue;
+            }
+            const streamError = (parsed as { type?: string; error?: { message?: string } })
+              ?.type === "error"
+              ? (parsed as { error?: { message?: string } }).error
+              : null;
+            if (streamError) {
+              throw new Error(
+                `${provider.label} stream error: ${streamError.message ?? "unknown"}`,
+              );
+            }
+            const delta = extractDelta(provider.kind, parsed);
+            if (delta) {
+              full += delta;
+              controller.enqueue(encoder.encode(delta));
             }
           }
         }
+      } catch (e) {
+        failure = e instanceof Error ? e : new Error("Stream failed");
       } finally {
         if (full.trim()) {
           await db
@@ -133,7 +167,8 @@ export async function POST(req: NextRequest) {
             .values({ conversationId, role: "assistant", content: full })
             .catch(() => {});
         }
-        controller.close();
+        if (failure) controller.error(failure);
+        else controller.close();
       }
     },
   });
