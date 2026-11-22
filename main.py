@@ -21,7 +21,6 @@ if os.path.isdir(USER_SITE) and USER_SITE not in sys.path:
 import time
 import random
 import argparse
-import itertools
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
@@ -33,14 +32,14 @@ sys.path.insert(0, SCRIPT_DIR)
 from stealth import apply_stealth, STEALTH_CHROMIUM_ARGS, DEFAULT_USER_AGENT, DEFAULT_VIEWPORT, generate_device_profile
 from solvers import universal_resolve, is_shortener
 try:
-    from proxy_manager import scrape_and_validate_proxies, fetch_all_raw_proxies, DynamicProxyPool
+    from proxy_manager import scrape_and_validate_proxies, fetch_all_raw_proxies, test_proxy, DynamicProxyPool
 except ImportError:
     scrape_and_validate_proxies = None
     fetch_all_raw_proxies = None
+    test_proxy = None
     DynamicProxyPool = None
 
 print_lock = threading.Lock()
-proxy_lock = threading.Lock()
 
 def safe_print(*args, **kwargs):
     with print_lock:
@@ -63,6 +62,10 @@ def parse_proxy(raw: str):
     parts = raw.split(":")
     if len(parts) == 4 and not raw.startswith("http") and not raw.startswith("socks"):
         ip, port, user, pwd = parts
+        try:
+            int(port)
+        except ValueError:
+            return None
         return {
             "server": f"http://{ip}:{port}",
             "username": user,
@@ -84,7 +87,10 @@ def parse_proxy(raw: str):
     if not hostname:
         return None
 
-    port = parsed.port
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
     if not port:
         port = 1080 if scheme == "socks5" else (443 if scheme == "https" else 80)
 
@@ -104,7 +110,7 @@ def parse_proxy(raw: str):
 
     return d
 
-def load_proxies(proxy_arg=None, proxy_file="proxies.txt", use_public=False, public_limit=5):
+def load_proxies(proxy_arg=None, proxy_file="proxies.txt", use_public=False, public_limit=5, validate_each=True, validate_upfront=True, min_threshold=8, target_size=20):
     proxies = []
 
     if proxy_arg:
@@ -119,7 +125,6 @@ def load_proxies(proxy_arg=None, proxy_file="proxies.txt", use_public=False, pub
                 p = parse_proxy(lp)
                 if p:
                     proxies.append(p)
-            return proxies
         else:
             safe_print("⚠️ proxy_manager module not found, skipping public proxy scraping.")
 
@@ -131,14 +136,38 @@ def load_proxies(proxy_arg=None, proxy_file="proxies.txt", use_public=False, pub
 
     if os.path.isfile(target_path):
         with open(target_path, "r", encoding="utf-8") as f:
-            for line in f:
-                p = parse_proxy(line)
-                if p:
-                    proxies.append(p)
+            raw_lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
+        if raw_lines and validate_each:
+            if validate_upfront:
+                safe_print(f"🔍 Validating {len(raw_lines)} proxies upfront...")
+                if test_proxy:
+                    for i, line in enumerate(raw_lines, 1):
+                        p = parse_proxy(line)
+                        if p:
+                            server = p.get("server", "")
+                            if test_proxy(server):
+                                proxies.append(p)
+                                safe_print(f"   ✅ [{i}/{len(raw_lines)}] Live: {server}")
+                            else:
+                                safe_print(f"   ❌ [{i}/{len(raw_lines)}] Dead: {server}")
+                        else:
+                            safe_print(f"   ⚠️ [{i}/{len(raw_lines)}] Invalid format: {line}")
+            else:
+                safe_print(f"📋 Loaded {len(raw_lines)} proxies (lazy validation: will test one-by-one at use time)...")
+                for line in raw_lines:
+                    p = parse_proxy(line)
+                    if p:
+                        proxies.append(p)
+
+    # Wrap in DynamicProxyPool for centralized validation & rotation
+    if proxies and DynamicProxyPool:
+        safe_print(f"🌐 Initializing DynamicProxyPool with {len(proxies)} proxies (target: {target_size}, min: {min_threshold})")
+        return DynamicProxyPool(initial_proxies=proxies, min_threshold=min_threshold, target_size=target_size)
+    
     return proxies
 
-def resolve_single_link(browser, item, proxy_pool=None, current_proxy=None, timeout_sec=30,
+def resolve_single_link(browser, item, proxy_list=None, timeout_sec=30,
                         device_type="auto", dwell_sec=0):
     idx, total, raw_url = item
     url = normalize_url(raw_url)
@@ -146,13 +175,8 @@ def resolve_single_link(browser, item, proxy_pool=None, current_proxy=None, time
     safe_print(f"[{idx}/{total}] 🔍 Resolving: {url}")
     safe_print(f"[{idx}/{total}] 📱 Device: {profile['label']}")
 
-    max_attempts = 3 if proxy_pool else 1
-    final_destination = None
-    working_proxy = None
-
     def handle_popup(popup):
         try:
-            # Smart Popup Glance: allow popup to load and pause 1.2-2.5s (genuine user glance)
             popup.wait_for_load_state("domcontentloaded", timeout=3500)
             time.sleep(random.uniform(1.2, 2.5))
         except Exception:
@@ -162,6 +186,51 @@ def resolve_single_link(browser, item, proxy_pool=None, current_proxy=None, time
                 popup.close()
             except Exception:
                 pass
+
+    def run_with_proxy(proxy_to_use):
+        safe_print(f"[{idx}/{total}] 🛡️  Proxy: {proxy_to_use['display']}")
+        context = None
+        try:
+            context_opts = {
+                "user_agent": profile["user_agent"],
+                "viewport": profile["viewport"],
+                "is_mobile": profile["is_mobile"],
+                "has_touch": profile["has_touch"],
+                "device_scale_factor": profile["device_scale_factor"],
+                "ignore_https_errors": True
+            }
+            context_opts["proxy"] = {
+                "server": proxy_to_use["server"]
+            }
+            if "username" in proxy_to_use:
+                context_opts["proxy"]["username"] = proxy_to_use["username"]
+            if "password" in proxy_to_use:
+                context_opts["proxy"]["password"] = proxy_to_use["password"]
+
+            context = browser.new_context(**context_opts)
+            apply_stealth(context, profile=profile)
+
+            page = context.new_page()
+            page.on("popup", handle_popup)
+
+            res = universal_resolve(
+                page, url, timeout_sec=timeout_sec, proxy=proxy_to_use,
+                is_mobile=profile["is_mobile"], dwell_sec=dwell_sec
+            )
+
+            if res and not is_shortener(res):
+                return res, proxy_to_use
+            else:
+                return None, None
+        except Exception as err:
+            safe_print(f"[{idx}/{total}] ⚠️ Proxy error: {err}")
+            return None, None
+        finally:
+            if context:
+                try:
+                    context.close()
+                except Exception:
+                    pass
 
     def run_direct_fallback():
         safe_print(f"[{idx}/{total}] 🌐 Fallback: Trying direct connection...")
@@ -192,86 +261,48 @@ def resolve_single_link(browser, item, proxy_pool=None, current_proxy=None, time
                 except Exception:
                     pass
 
-    for attempt in range(1, max_attempts + 1):
-        context = None
-        proxy_to_use = None
-        try:
-            context_opts = {
-                "user_agent": profile["user_agent"],
-                "viewport": profile["viewport"],
-                "is_mobile": profile["is_mobile"],
-                "has_touch": profile["has_touch"],
-                "device_scale_factor": profile["device_scale_factor"],
-                "ignore_https_errors": True
-            }
-
-            if proxy_pool:
-                # Rotate to a fresh unique proxy for every link to guarantee distinct IP per impression
-                if hasattr(proxy_pool, "get_proxy"):
-                    proxy_to_use = proxy_pool.get_proxy()
+    # Try proxies one by one with lazy validation
+    if proxy_list and test_proxy:
+        # Check if using DynamicProxyPool
+        if DynamicProxyPool and isinstance(proxy_list, DynamicProxyPool):
+            # Use DynamicProxyPool's get_proxy() which validates internally
+            proxy = proxy_list.get_proxy()
+            if proxy:
+                server = proxy.get("server", "")
+                safe_print(f"[{idx}/{total}] 🛡️  Using validated proxy: {proxy['display']}")
+                final_destination, working_proxy = run_with_proxy(proxy)
+                if final_destination:
+                    return final_destination, working_proxy
+                safe_print(f"[{idx}/{total}] ⚠️ Proxy worked but resolution failed, trying next...")
+                proxy_list.report_failure(proxy, "resolution failed")
+                # Try next proxy from pool
+                proxy = proxy_list.get_proxy()
+                while proxy:
+                    safe_print(f"[{idx}/{total}] 🛡️  Using validated proxy: {proxy['display']}")
+                    final_destination, working_proxy = run_with_proxy(proxy)
+                    if final_destination:
+                        return final_destination, working_proxy
+                    safe_print(f"[{idx}/{total}] ⚠️ Proxy worked but resolution failed, trying next...")
+                    proxy_list.report_failure(proxy, "resolution failed")
+                    proxy = proxy_list.get_proxy()
+            else:
+                safe_print(f"[{idx}/{total}] ⚠️ No working proxies in pool")
+        else:
+            # Old logic for raw proxy list
+            for proxy in proxy_list:
+                server = proxy.get("server", "")
+                safe_print(f"[{idx}/{total}] 🔎 Testing proxy: {server}")
+                if test_proxy(server):
+                    safe_print(f"[{idx}/{total}] ✅ Proxy validated, using it")
+                    final_destination, working_proxy = run_with_proxy(proxy)
+                    if final_destination:
+                        return final_destination, working_proxy
+                    safe_print(f"[{idx}/{total}] ⚠️ Proxy worked but resolution failed, trying next...")
                 else:
-                    with proxy_lock:
-                        proxy_to_use = next(proxy_pool)
+                    safe_print(f"[{idx}/{total}] ❌ Proxy dead, trying next...")
 
-                if proxy_to_use:
-                    safe_print(f"[{idx}/{total}] 🛡️  Proxy: {proxy_to_use['display']}")
-                    context_opts["proxy"] = {
-                        "server": proxy_to_use["server"]
-                    }
-                    if "username" in proxy_to_use:
-                        context_opts["proxy"]["username"] = proxy_to_use["username"]
-                    if "password" in proxy_to_use:
-                        context_opts["proxy"]["password"] = proxy_to_use["password"]
-
-            context = browser.new_context(**context_opts)
-            apply_stealth(context, profile=profile)
-
-            page = context.new_page()
-            page.on("popup", handle_popup)
-
-            res = universal_resolve(
-                page, url, timeout_sec=timeout_sec, proxy=proxy_to_use,
-                is_mobile=profile["is_mobile"], dwell_sec=dwell_sec
-            )
-
-            if res and not is_shortener(res):
-                final_destination = res
-                working_proxy = proxy_to_use
-                if proxy_pool and hasattr(proxy_pool, "report_success") and proxy_to_use:
-                    proxy_pool.report_success(proxy_to_use)
-                break
-            else:
-                # "Shortener incomplete" = site blocked datacenter IP, NOT proxy failure
-                # Only report actual connection errors as proxy failures
-                if proxy_pool and hasattr(proxy_pool, "report_failure") and proxy_to_use:
-                    # Don't discard proxy for shortener-side blocking
-                    pass
-                current_proxy = None  # Discard sticky proxy on failure
-                if attempt < max_attempts:
-                    safe_print(f"[{idx}/{total}] ⚠️ Proxy failed. Switching to next proxy from pool...")
-                elif proxy_pool:
-                    final_destination = run_direct_fallback()
-                    if final_destination and not is_shortener(final_destination):
-                        break
-
-        except Exception as err:
-            if proxy_pool and hasattr(proxy_pool, "report_failure") and proxy_to_use:
-                proxy_pool.report_failure(proxy_to_use, str(err))
-            current_proxy = None  # Discard sticky proxy on failure
-            if attempt < max_attempts:
-                safe_print(f"[{idx}/{total}] ⚠️ Error with proxy ({err}). Switching to next proxy from pool...")
-            elif proxy_pool:
-                final_destination = run_direct_fallback()
-                if final_destination and not is_shortener(final_destination):
-                    break
-            else:
-                safe_print(f"[{idx}/{total}] ❌ Failed: {err}")
-        finally:
-            if context:
-                try:
-                    context.close()
-                except Exception:
-                    pass
+    # No working proxy found, try direct
+    final_destination = run_direct_fallback()
 
     status = "FAILED"
     if final_destination == "[EXPIRED / DELETED LINK]":
@@ -289,12 +320,12 @@ def resolve_single_link(browser, item, proxy_pool=None, current_proxy=None, time
         "input_url": raw_url,
         "destination": final_destination,
         "status": status
-    }, working_proxy
+    }, None
 
-def worker_batch_task(batch_items, proxy_pool, timeout_sec, device_type="auto", dwell_sec=0):
+def worker_batch_task(batch_items, proxy_list, timeout_sec, device_type="auto", dwell_sec=0):
     """
     Worker task that launches Chromium once and processes all items in its batch.
-    Rotates to a fresh unique proxy for each link to maximize registered impressions.
+    Tries proxies one by one with lazy validation for each link.
     """
     results = []
     with sync_playwright() as p:
@@ -305,8 +336,8 @@ def worker_batch_task(batch_items, proxy_pool, timeout_sec, device_type="auto", 
         try:
             for item in batch_items:
                 r, _ = resolve_single_link(
-                    browser, item, proxy_pool=proxy_pool,
-                    current_proxy=None, timeout_sec=timeout_sec,
+                    browser, item, proxy_list=proxy_list,
+                    timeout_sec=timeout_sec,
                     device_type=device_type, dwell_sec=dwell_sec
                 )
                 results.append(r)
@@ -320,21 +351,18 @@ def process_links(urls, proxies=None, concurrency=2, timeout_sec=30, output_file
     total = len(urls)
     concurrency = max(1, min(concurrency, 4))
 
-    proxy_pool = None
-    if proxies and DynamicProxyPool:
-        raw_file = os.path.join(SCRIPT_DIR, "proxies_raw.txt")
-        active_file = os.path.join(SCRIPT_DIR, "proxies.txt")
-        proxy_pool = DynamicProxyPool(
-            initial_proxies=proxies,
-            min_threshold=min(max(min_proxies, 10), len(proxies)),
-            target_size=len(proxies),
-            raw_file=raw_file,
-            active_file=active_file
-        )
-    elif proxies:
-        proxy_pool = itertools.cycle(proxies)
+    proxy_list = proxies  # Use raw proxy list directly for lazy validation
 
-    proxy_count = proxy_pool.size() if hasattr(proxy_pool, "size") else (len(proxies) if proxies else 0)
+    # Get proxy count for display
+    if proxy_list and DynamicProxyPool and isinstance(proxy_list, DynamicProxyPool):
+        proxy_count = proxy_list.size()
+        proxy_mode = f"🌐 Proxy Mode:         DynamicProxyPool ({proxy_count} active, target: {proxy_list.target_size}, min: {proxy_list.min_threshold})"
+    elif proxy_list:
+        proxy_count = len(proxy_list)
+        proxy_mode = f"🌐 Proxy Mode:         {proxy_count} proxies (Lazy Validation: test one-by-one at use time)"
+    else:
+        proxy_count = 0
+        proxy_mode = "🌐 Proxy Mode:         Direct Connection (No proxy)"
 
     print(f"\n🚀 Autonomous Link Resolver Engine Started:")
     print(f"   📊 Total Links:        {total}")
@@ -343,10 +371,7 @@ def process_links(urls, proxies=None, concurrency=2, timeout_sec=30, output_file
     print(f"   📱 Device Profile:     {device_type.upper()} Mode (Android / iOS / Desktop)")
     if dwell_sec > 0:
         print(f"   ⏳ Monetization Dwell: ACTIVE ({dwell_sec}s reading dwell on destination)")
-    if proxy_count > 0:
-        print(f"   🌐 Dynamic Proxy Pool: {proxy_count} active (Auto-Health & Auto-Refill: ACTIVE)")
-    else:
-        print("   🌐 Proxy Mode:         Direct Connection (No proxy)")
+    print(f"   {proxy_mode}")
     if loop:
         print(f"   🔄 Mode:               INFINITE LOOP (Continuous automated cycle)")
     elif rounds > 1:
@@ -365,19 +390,18 @@ def process_links(urls, proxies=None, concurrency=2, timeout_sec=30, output_file
     try:
         while True:
             round_idx += 1
-            curr_pool_size = proxy_pool.size() if hasattr(proxy_pool, 'size') else (proxy_count if proxy_count > 0 else 'N/A')
 
             if loop:
-                print(f"\n{'='*60}\n🔄 ROUND {round_idx} (Infinite Loop Mode | Active Proxies in Pool: {curr_pool_size})\n{'='*60}")
+                print(f"\n{'='*60}\n🔄 ROUND {round_idx} (Infinite Loop Mode)\n{'='*60}")
             elif rounds > 1:
-                print(f"\n{'='*60}\n🔄 ROUND {round_idx} of {rounds} (Active Proxies in Pool: {curr_pool_size})\n{'='*60}")
+                print(f"\n{'='*60}\n🔄 ROUND {round_idx} of {rounds}\n{'='*60}")
 
             items = [(i, total, u) for i, u in enumerate(urls, 1)]
             results = []
 
             round_start = time.time()
             if concurrency == 1 or total == 1:
-                results = worker_batch_task(items, proxy_pool, timeout_sec, device_type=device_type, dwell_sec=dwell_sec)
+                results = worker_batch_task(items, proxy_list, timeout_sec, device_type=device_type, dwell_sec=dwell_sec)
             else:
                 actual_workers = min(concurrency, total)
                 batches = [[] for _ in range(actual_workers)]
@@ -385,7 +409,7 @@ def process_links(urls, proxies=None, concurrency=2, timeout_sec=30, output_file
                     batches[i % actual_workers].append(item)
 
                 with ThreadPoolExecutor(max_workers=actual_workers) as executor:
-                    futures = [executor.submit(worker_batch_task, b, proxy_pool, timeout_sec, device_type, dwell_sec) for b in batches if b]
+                    futures = [executor.submit(worker_batch_task, b, proxy_list, timeout_sec, device_type, dwell_sec) for b in batches if b]
                     for f in as_completed(futures):
                         try:
                             batch_res = f.result()
@@ -404,7 +428,7 @@ def process_links(urls, proxies=None, concurrency=2, timeout_sec=30, output_file
             total_sessions_success += success_count
 
             print("-" * 60)
-            print(f"📊 ROUND {round_idx} COMPLETE ({round_elapsed}s) | Success: {success_count}/{total} | Active Proxies: {proxy_pool.size() if hasattr(proxy_pool, 'size') else 'N/A'}")
+            print(f"📊 ROUND {round_idx} COMPLETE ({round_elapsed}s) | Success: {success_count}/{total}")
             print("-" * 60)
 
             # Save / append to output_file if requested
@@ -454,8 +478,8 @@ def process_links(urls, proxies=None, concurrency=2, timeout_sec=30, output_file
     print(f"  🔄 Rounds Executed:         {round_idx}")
     print(f"  🔢 Total Visits Attempted:  {total_sessions_processed}")
     print(f"  ✅ Successful Resolves:     {total_sessions_success}")
-    if proxy_pool and hasattr(proxy_pool, "size"):
-        print(f"  🛡️ Healthy Proxies in Pool: {proxy_pool.size()}")
+    if proxy_count > 0:
+        print(f"  🌐 Proxies Available:       {proxy_count}")
     print(f"  ⏱️ Total Session Time:      {total_elapsed}s")
     print("=" * 60 + "\n")
 
@@ -571,15 +595,26 @@ Usage Examples:
         proxy_arg=args.proxy,
         proxy_file=args.proxy_file,
         use_public=args.public_proxies or args.save_proxies,
-        public_limit=args.proxy_limit
+        public_limit=args.proxy_limit,
+        validate_each=not args.public_proxies,  # skip for public (already validated by scrape_and_validate)
+        validate_upfront=False,  # lazy validation: test one-by-one at use time
+        min_threshold=args.min_proxies,
+        target_size=args.min_proxies + 10
     )
 
     if args.save_proxies and proxies:
         save_path = os.path.join(SCRIPT_DIR, "proxies.txt")
         with open(save_path, "w", encoding="utf-8") as pf:
-            for pr in proxies:
-                pf.write(f"{pr['server']}\n")
-        print(f"💾 Saved {len(proxies)} validated proxies to: {save_path}\n")
+            if DynamicProxyPool and isinstance(proxies, DynamicProxyPool):
+                # Get all active proxies from pool
+                active = list(proxies.active_proxies)
+                for pr in active:
+                    pf.write(f"{pr['server']}\n")
+                print(f"💾 Saved {len(active)} validated proxies to: {save_path}\n")
+            elif isinstance(proxies, list):
+                for pr in proxies:
+                    pf.write(f"{pr['server']}\n")
+                print(f"💾 Saved {len(proxies)} validated proxies to: {save_path}\n")
 
     if args.once:
         is_loop = False

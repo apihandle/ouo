@@ -234,6 +234,12 @@ class DynamicProxyPool:
         self.raw_candidates = candidates
         self.candidate_index = 0
 
+    def validate_proxy(self, proxy_str: str, test_url: str = "https://ouo.press", timeout: int = 5) -> bool:
+        """Validate a single proxy synchronously - returns True if live."""
+        from proxy_manager import test_proxy
+        result = test_proxy(proxy_str, test_url, timeout)
+        return result is not None
+
     def size(self) -> int:
         with self.lock:
             return len(self.active_proxies)
@@ -241,21 +247,35 @@ class DynamicProxyPool:
     def get_proxy(self):
         """
         Retrieves the next healthy proxy and rotates it to the end of queue.
+        Validates each proxy before returning - if dead, removes and tries next.
         Triggers auto-refill if pool drops below threshold.
         """
         should_refill = False
         with self.lock:
-            if not self.active_proxies:
-                if not self.is_refilling:
-                    self.is_refilling = True
-                    should_refill = True
-                p = None
-            else:
+            while self.active_proxies:
                 p = self.active_proxies[0]
                 self.active_proxies.rotate(-1)
-                if len(self.active_proxies) < self.min_threshold and not self.is_refilling:
-                    self.is_refilling = True
-                    should_refill = True
+                server = p.get("server", "")
+                # Validate before returning
+                if self.validate_proxy(server):
+                    if len(self.active_proxies) < self.min_threshold and not self.is_refilling:
+                        self.is_refilling = True
+                        should_refill = True
+                    if should_refill:
+                        threading.Thread(target=self._background_refill, daemon=True).start()
+                    return p
+                else:
+                    # Dead proxy - remove from pool
+                    self.active_proxies = collections.deque(
+                        x for x in self.active_proxies if x.get("server") != server
+                    )
+                    print(f"⚠️ [Proxy Dead] {p.get('display', server)} removed from pool")
+            
+            # No proxies left
+            if not self.is_refilling:
+                self.is_refilling = True
+                should_refill = True
+            p = None
 
         if should_refill:
             threading.Thread(target=self._background_refill, daemon=True).start()
