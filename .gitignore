@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+proxies.txt
+proxies_raw.txt
+impressions.txt
+test_links.txt
+*.log
