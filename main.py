@@ -10,6 +10,7 @@ Features:
   6. 🛡️ Public Proxy Scraping, Rotation & Auto-Failover
 """
 
+print("DEBUG: Script started")
 import sys
 import os
 
@@ -31,12 +32,33 @@ sys.path.insert(0, SCRIPT_DIR)
 
 from stealth import apply_stealth, STEALTH_CHROMIUM_ARGS, DEFAULT_USER_AGENT, DEFAULT_VIEWPORT, generate_device_profile
 from solvers import universal_resolve, is_shortener
+
+# Try enhanced proxy manager v2 first, fall back to v1
+load_proxies_v2 = None
+EnhancedProxyPool = None
+ProxyEntry = None
+USE_ENHANCED_PROXY = False
+
 try:
-    from proxy_manager import scrape_and_validate_proxies, fetch_all_raw_proxies, test_proxy, DynamicProxyPool
+    from proxy_manager_v2 import (
+        scrape_and_validate_proxies, fetch_all_raw_proxies, test_proxy_basic as test_proxy,
+        EnhancedProxyPool as _EnhancedProxyPool, load_proxies_v2 as _load_proxies_v2, ProxyEntry as _ProxyEntry
+    )
+    EnhancedProxyPool = _EnhancedProxyPool
+    load_proxies_v2 = _load_proxies_v2
+    ProxyEntry = _ProxyEntry
+    USE_ENHANCED_PROXY = True
 except ImportError:
-    scrape_and_validate_proxies = None
-    fetch_all_raw_proxies = None
-    test_proxy = None
+    try:
+        from proxy_manager import scrape_and_validate_proxies, fetch_all_raw_proxies, test_proxy, DynamicProxyPool
+    except ImportError:
+        scrape_and_validate_proxies = None
+        fetch_all_raw_proxies = None
+        test_proxy = None
+        DynamicProxyPool = None
+    USE_ENHANCED_PROXY = False
+    EnhancedProxyPool = None
+    ProxyEntry = None
     DynamicProxyPool = None
 
 print_lock = threading.Lock()
@@ -110,62 +132,83 @@ def parse_proxy(raw: str):
 
     return d
 
-def load_proxies(proxy_arg=None, proxy_file="proxies.txt", use_public=False, public_limit=5, validate_each=True, validate_upfront=True, min_threshold=8, target_size=20):
-    proxies = []
+def load_proxies(proxy_arg=None, proxy_file="proxies.txt", use_public=False, public_limit=5, validate_each=True, validate_upfront=True, min_threshold=8, target_size=20, enable_ouo_validation=True):
+    print("DEBUG: load_proxies called")
+    
+    # Use enhanced proxy manager if available
+    if USE_ENHANCED_PROXY:
+        return load_proxies_v2(
+            proxy_arg=proxy_arg,
+            proxy_file=proxy_file,
+            use_public=use_public,
+            public_limit=public_limit,
+            validate_each=validate_each,
+            validate_upfront=validate_upfront,
+            min_threshold=min_threshold,
+            target_size=target_size,
+            enable_ouo_validation=enable_ouo_validation,
+        )
+    
+    # Fallback to v1 logic
+    def load_proxies_v1(proxy_arg=None, proxy_file="proxies.txt", use_public=False, public_limit=5, validate_each=True, validate_upfront=True, min_threshold=8, target_size=20, enable_ouo_validation=True):
+        print("DEBUG: load_proxies called (v1 fallback)")
+        proxies = []
 
-    if proxy_arg:
-        p = parse_proxy(proxy_arg)
-        if p:
-            return [p]
+        if proxy_arg:
+            p = parse_proxy(proxy_arg)
+            if p:
+                return [p]
 
-    if use_public:
-        if scrape_and_validate_proxies:
-            live_proxies = scrape_and_validate_proxies(limit=public_limit)
-            for lp in live_proxies:
-                p = parse_proxy(lp)
-                if p:
-                    proxies.append(p)
-        else:
-            safe_print("⚠️ proxy_manager module not found, skipping public proxy scraping.")
-
-    target_path = proxy_file
-    if not os.path.isfile(target_path):
-        fallback = os.path.join(SCRIPT_DIR, "proxies.txt")
-        if os.path.isfile(fallback):
-            target_path = fallback
-
-    if os.path.isfile(target_path):
-        with open(target_path, "r", encoding="utf-8") as f:
-            raw_lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-
-        if raw_lines and validate_each:
-            if validate_upfront:
-                safe_print(f"🔍 Validating {len(raw_lines)} proxies upfront...")
-                if test_proxy:
-                    for i, line in enumerate(raw_lines, 1):
-                        p = parse_proxy(line)
-                        if p:
-                            server = p.get("server", "")
-                            if test_proxy(server):
-                                proxies.append(p)
-                                safe_print(f"   ✅ [{i}/{len(raw_lines)}] Live: {server}")
-                            else:
-                                safe_print(f"   ❌ [{i}/{len(raw_lines)}] Dead: {server}")
-                        else:
-                            safe_print(f"   ⚠️ [{i}/{len(raw_lines)}] Invalid format: {line}")
-            else:
-                safe_print(f"📋 Loaded {len(raw_lines)} proxies (lazy validation: will test one-by-one at use time)...")
-                for line in raw_lines:
-                    p = parse_proxy(line)
+        if use_public:
+            if scrape_and_validate_proxies:
+                live_proxies = scrape_and_validate_proxies(limit=public_limit)
+                for lp in live_proxies:
+                    p = parse_proxy(lp)
                     if p:
                         proxies.append(p)
+            else:
+                safe_print("⚠️ proxy_manager module not found, skipping public proxy scraping.")
 
-    # Wrap in DynamicProxyPool for centralized validation & rotation
-    if proxies and DynamicProxyPool:
-        safe_print(f"🌐 Initializing DynamicProxyPool with {len(proxies)} proxies (target: {target_size}, min: {min_threshold})")
-        return DynamicProxyPool(initial_proxies=proxies, min_threshold=min_threshold, target_size=target_size)
+        target_path = proxy_file
+        if not os.path.isfile(target_path):
+            fallback = os.path.join(SCRIPT_DIR, "proxies.txt")
+            if os.path.isfile(fallback):
+                target_path = fallback
+
+        if os.path.isfile(target_path):
+            with open(target_path, "r", encoding="utf-8") as f:
+                raw_lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+            if raw_lines and validate_each:
+                if validate_upfront:
+                    safe_print(f"🔍 Validating {len(raw_lines)} proxies upfront...")
+                    if test_proxy:
+                        for i, line in enumerate(raw_lines, 1):
+                            p = parse_proxy(line)
+                            if p:
+                                server = p.get("server", "")
+                                if test_proxy(server):
+                                    proxies.append(p)
+                                    safe_print(f"   ✅ [{i}/{len(raw_lines)}] Live: {server}")
+                                else:
+                                    safe_print(f"   ❌ [{i}/{len(raw_lines)}] Dead: {server}")
+                            else:
+                                safe_print(f"   ⚠️ [{i}/{len(raw_lines)}] Invalid format: {line}")
+                else:
+                    safe_print(f"📋 Loaded {len(raw_lines)} proxies (lazy validation: will test one-by-one at use time)...")
+                    for line in raw_lines:
+                        p = parse_proxy(line)
+                        if p:
+                            proxies.append(p)
+
+        # Wrap in DynamicProxyPool for centralized validation & rotation
+        if proxies and DynamicProxyPool:
+            safe_print(f"🌐 Initializing DynamicProxyPool with {len(proxies)} proxies (target: {target_size}, min: {min_threshold})")
+            return DynamicProxyPool(initial_proxies=proxies, min_threshold=min_threshold, target_size=target_size, raw_file=target_path)
+        
+        return proxies
     
-    return proxies
+    return load_proxies_v1(proxy_arg, proxy_file, use_public, public_limit, validate_each, validate_upfront, min_threshold, target_size)
 
 def resolve_single_link(browser, item, proxy_list=None, timeout_sec=30,
                         device_type="auto", dwell_sec=0):
@@ -187,8 +230,33 @@ def resolve_single_link(browser, item, proxy_list=None, timeout_sec=30,
             except Exception:
                 pass
 
+    def get_proxy_server(proxy):
+        """Extract server string from proxy (dict or ProxyEntry)."""
+        if proxy is None:
+            return None
+        if hasattr(proxy, 'server'):  # ProxyEntry
+            return proxy.server
+        return proxy.get("server", "")
+
+    def get_proxy_display(proxy):
+        """Extract display string from proxy (dict or ProxyEntry)."""
+        if proxy is None:
+            return "unknown"
+        if hasattr(proxy, 'display'):  # ProxyEntry
+            return proxy.display
+        return proxy.get("display", proxy.get("server", "unknown"))
+
+    def get_proxy_auth(proxy):
+        """Extract username/password from proxy (dict or ProxyEntry)."""
+        if proxy is None:
+            return None, None
+        if hasattr(proxy, 'username'):  # ProxyEntry
+            return proxy.username, proxy.password
+        return proxy.get("username"), proxy.get("password")
+
     def run_with_proxy(proxy_to_use):
-        safe_print(f"[{idx}/{total}] 🛡️  Proxy: {proxy_to_use['display']}")
+        display = get_proxy_display(proxy_to_use)
+        safe_print(f"[{idx}/{total}] 🛡️  Proxy: {display}")
         context = None
         try:
             context_opts = {
@@ -199,13 +267,13 @@ def resolve_single_link(browser, item, proxy_list=None, timeout_sec=30,
                 "device_scale_factor": profile["device_scale_factor"],
                 "ignore_https_errors": True
             }
-            context_opts["proxy"] = {
-                "server": proxy_to_use["server"]
-            }
-            if "username" in proxy_to_use:
-                context_opts["proxy"]["username"] = proxy_to_use["username"]
-            if "password" in proxy_to_use:
-                context_opts["proxy"]["password"] = proxy_to_use["password"]
+            server = get_proxy_server(proxy_to_use)
+            context_opts["proxy"] = {"server": server}
+            username, password = get_proxy_auth(proxy_to_use)
+            if username:
+                context_opts["proxy"]["username"] = username
+            if password:
+                context_opts["proxy"]["password"] = password
 
             context = browser.new_context(**context_opts)
             apply_stealth(context, profile=profile)
@@ -261,11 +329,43 @@ def resolve_single_link(browser, item, proxy_list=None, timeout_sec=30,
                 except Exception:
                     pass
 
-    # Try proxies one by one with lazy validation
+    # Track if we used enhanced proxy pool
+    used_enhanced_pool = USE_ENHANCED_PROXY and EnhancedProxyPool and isinstance(proxy_list, EnhancedProxyPool)
+    used_dynamic_pool = (not USE_ENHANCED_PROXY) and DynamicProxyPool and isinstance(proxy_list, DynamicProxyPool)
+    
+    # Try proxies
     if proxy_list and test_proxy:
-        # Check if using DynamicProxyPool
-        if DynamicProxyPool and isinstance(proxy_list, DynamicProxyPool):
-            # Use DynamicProxyPool's get_proxy() which validates internally
+        if used_enhanced_pool:
+            # Enhanced pool: get best proxy, try resolution, report result
+            max_attempts = min(5, proxy_list.size())
+            for attempt in range(max_attempts):
+                proxy = proxy_list.get_proxy()
+                if not proxy:
+                    safe_print(f"[{idx}/{total}] ⚠️ No working proxies in pool")
+                    break
+                
+                display = get_proxy_display(proxy)
+                safe_print(f"[{idx}/{total}] 🛡️  Using validated proxy: {display} (score: {proxy.metrics.score:.3f})")
+                final_destination, working_proxy = run_with_proxy(proxy)
+                
+                is_ouo = "ouo." in url
+                expired = final_destination == "[EXPIRED / DELETED LINK]"
+                
+                if final_destination:
+                    proxy_list.report_success(proxy, is_ouo=is_ouo, expired=expired)
+                    if expired:
+                        safe_print(f"[{idx}/{total}] ⚠️ Status: EXPIRED / DELETED (No longer active on OUO)\n")
+                    else:
+                        safe_print(f"[{idx}/{total}] 👉 Final Destination: {final_destination}\n")
+                    return final_destination, working_proxy
+                
+                safe_print(f"[{idx}/{total}] ⚠️ Proxy worked but resolution failed, trying next...")
+                proxy_list.report_failure(proxy, "resolution failed", is_ouo=is_ouo)
+            
+            safe_print(f"[{idx}/{total}] ⚠️ Exhausted all proxies in pool")
+        
+        elif used_dynamic_pool:
+            # Original DynamicProxyPool logic
             proxy = proxy_list.get_proxy()
             if proxy:
                 server = proxy.get("server", "")
@@ -287,10 +387,12 @@ def resolve_single_link(browser, item, proxy_list=None, timeout_sec=30,
                     proxy = proxy_list.get_proxy()
             else:
                 safe_print(f"[{idx}/{total}] ⚠️ No working proxies in pool")
+        
         else:
             # Old logic for raw proxy list
             for proxy in proxy_list:
-                server = proxy.get("server", "")
+                server = get_proxy_server(proxy)
+                display = get_proxy_display(proxy)
                 safe_print(f"[{idx}/{total}] 🔎 Testing proxy: {server}")
                 if test_proxy(server):
                     safe_print(f"[{idx}/{total}] ✅ Proxy validated, using it")
@@ -354,9 +456,21 @@ def process_links(urls, proxies=None, concurrency=2, timeout_sec=30, output_file
     proxy_list = proxies  # Use raw proxy list directly for lazy validation
 
     # Get proxy count for display
-    if proxy_list and DynamicProxyPool and isinstance(proxy_list, DynamicProxyPool):
+    used_enhanced_pool = USE_ENHANCED_PROXY and EnhancedProxyPool and isinstance(proxy_list, EnhancedProxyPool)
+    used_dynamic_pool = (not USE_ENHANCED_PROXY) and DynamicProxyPool and isinstance(proxy_list, DynamicProxyPool)
+    
+    if used_enhanced_pool:
+        stats = proxy_list.get_stats()
+        proxy_count = stats['size']
+        proxy_mode = f"🌐 Proxy Mode:         EnhancedProxyPool v2 ({proxy_count} active, target: {stats['target_size']}, min: {stats['min_threshold']})"
+        if stats['countries']:
+            top_countries = ', '.join(f"{k}({v})" for k,v in sorted(stats['countries'].items(), key=lambda x: -x[1])[:3])
+            proxy_mode += f" | Countries: {top_countries}"
+        if stats['avg_latency_ms'] > 0:
+            proxy_mode += f" | Avg Latency: {stats['avg_latency_ms']:.0f}ms"
+    elif used_dynamic_pool:
         proxy_count = proxy_list.size()
-        proxy_mode = f"🌐 Proxy Mode:         DynamicProxyPool ({proxy_count} active, target: {proxy_list.target_size}, min: {proxy_list.min_threshold})"
+        proxy_mode = f"🌐 Proxy Mode:         DynamicProxyPool v1 ({proxy_count} active, target: {proxy_list.target_size}, min: {proxy_list.min_threshold})"
     elif proxy_list:
         proxy_count = len(proxy_list)
         proxy_mode = f"🌐 Proxy Mode:         {proxy_count} proxies (Lazy Validation: test one-by-one at use time)"
@@ -372,15 +486,7 @@ def process_links(urls, proxies=None, concurrency=2, timeout_sec=30, output_file
     if dwell_sec > 0:
         print(f"   ⏳ Monetization Dwell: ACTIVE ({dwell_sec}s reading dwell on destination)")
     print(f"   {proxy_mode}")
-    if loop:
-        print(f"   🔄 Mode:               INFINITE LOOP (Continuous automated cycle)")
-    elif rounds > 1:
-        print(f"   🔄 Mode:               {rounds} Multi-Proxy Rounds")
-    else:
-        print("   🔄 Mode:               Single Batch Run")
-    if loop or rounds > 1:
-        print(f"   ⏱️ Round Interval:     {delay_sec}s delay between rounds")
-    print("-" * 60)
+    print("DEBUG: About to start processing...")
 
     total_sessions_processed = 0
     total_sessions_success = 0
@@ -431,6 +537,10 @@ def process_links(urls, proxies=None, concurrency=2, timeout_sec=30, output_file
             print(f"📊 ROUND {round_idx} COMPLETE ({round_elapsed}s) | Success: {success_count}/{total}")
             print("-" * 60)
 
+            # Show proxy pool stats every round for enhanced pool
+            if used_enhanced_pool and round_idx % 3 == 0:
+                proxy_list.print_stats()
+
             # Save / append to output_file if requested
             if output_file:
                 try:
@@ -480,6 +590,12 @@ def process_links(urls, proxies=None, concurrency=2, timeout_sec=30, output_file
     print(f"  ✅ Successful Resolves:     {total_sessions_success}")
     if proxy_count > 0:
         print(f"  🌐 Proxies Available:       {proxy_count}")
+        if used_enhanced_pool:
+            stats = proxy_list.get_stats()
+            print(f"  📈 Avg Proxy Score:         {stats['avg_score']:.3f}")
+            print(f"  ⚡ Avg Proxy Latency:       {stats['avg_latency_ms']:.0f} ms")
+            print(f"  🏠 Residential Proxies:     {stats['residential_proxies']}")
+            print(f"  🏢 Datacenter Proxies:      {stats['datacenter_proxies']}")
     print(f"  ⏱️ Total Session Time:      {total_elapsed}s")
     print("=" * 60 + "\n")
 
@@ -503,6 +619,7 @@ Usage Examples:
     )
     parser.add_argument("target", nargs="?", default=None,
                         help="URL or text file with links (default: links.txt if present)")
+    print("DEBUG: args added")
     parser.add_argument("-f", "--file", metavar="FILE", default=None,
                         help="Input file containing links (one per line)")
     parser.add_argument("-c", "--concurrency", type=int, default=3,
@@ -539,8 +656,11 @@ Usage Examples:
                         help="Target device fingerprint emulation (default: auto [70%% Android, 25%% iOS, 5%% Desktop])")
     parser.add_argument("--dwell", type=int, default=0, metavar="SEC",
                         help="Post-destination dwell time in seconds for high-quality ad impression registration (e.g. 15-30s)")
+    parser.add_argument("--full-ouo-validation", action="store_true",
+                        help="Enable full OUO flow validation for proxies (tests actual JavaScript resolution, slower but more accurate)")
 
     args = parser.parse_args()
+    print("DEBUG: args parsed")
 
     if args.fetch_proxies:
         if fetch_all_raw_proxies:
@@ -591,6 +711,7 @@ Usage Examples:
         print(f"⚠️ No valid links found to process in '{input_file}'.")
         sys.exit(0)
 
+    print("DEBUG: About to load proxies")
     proxies = load_proxies(
         proxy_arg=args.proxy,
         proxy_file=args.proxy_file,
@@ -599,13 +720,25 @@ Usage Examples:
         validate_each=not args.public_proxies,  # skip for public (already validated by scrape_and_validate)
         validate_upfront=False,  # lazy validation: test one-by-one at use time
         min_threshold=args.min_proxies,
-        target_size=args.min_proxies + 10
+        target_size=args.min_proxies + 10,
+        enable_ouo_validation=args.full_ouo_validation,
     )
+    print(f"DEBUG: Proxies loaded: {type(proxies)}")
+
+    # Check if using enhanced proxy pool
+    used_enhanced_pool = USE_ENHANCED_PROXY and EnhancedProxyPool and isinstance(proxies, EnhancedProxyPool)
+    used_dynamic_pool = (not USE_ENHANCED_PROXY) and DynamicProxyPool and isinstance(proxies, DynamicProxyPool)
 
     if args.save_proxies and proxies:
         save_path = os.path.join(SCRIPT_DIR, "proxies.txt")
         with open(save_path, "w", encoding="utf-8") as pf:
-            if DynamicProxyPool and isinstance(proxies, DynamicProxyPool):
+            if used_enhanced_pool:
+                # Save active proxies from enhanced pool
+                active = proxy_list.active_proxies
+                for pr in active:
+                    pf.write(f"{pr.server}\n")
+                print(f"💾 Saved {len(active)} validated proxies to: {save_path}\n")
+            elif DynamicProxyPool and isinstance(proxies, DynamicProxyPool):
                 # Get all active proxies from pool
                 active = list(proxies.active_proxies)
                 for pr in active:
@@ -613,7 +746,8 @@ Usage Examples:
                 print(f"💾 Saved {len(active)} validated proxies to: {save_path}\n")
             elif isinstance(proxies, list):
                 for pr in proxies:
-                    pf.write(f"{pr['server']}\n")
+                    server = pr.server if hasattr(pr, 'server') else pr.get('server', '')
+                    pf.write(f"{server}\n")
                 print(f"💾 Saved {len(proxies)} validated proxies to: {save_path}\n")
 
     if args.once:
