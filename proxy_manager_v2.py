@@ -1034,7 +1034,10 @@ def load_proxies(
         if os.path.isfile(fallback):
             target_path = fallback
     
-    if os.path.isfile(target_path):
+    # If we're using public proxies, don't also load from file (avoids untested proxies)
+    # Only load from file if NOT using public proxies
+    file_proxies = []
+    if not use_public and os.path.isfile(target_path):
         with open(target_path, "r", encoding="utf-8") as f:
             raw_lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
         
@@ -1048,7 +1051,7 @@ def load_proxies(
                         success, latency, error = test_proxy_basic(server)
                         if success:
                             p.metrics.record_test(True, latency)
-                            proxies.append(p)
+                            file_proxies.append(p)
                             print(f"   ✅ [{i}/{len(raw_lines)}] Live: {server} ({latency:.0f}ms)")
                         else:
                             print(f"   ❌ [{i}/{len(raw_lines)}] Dead: {server} ({error})")
@@ -1059,11 +1062,14 @@ def load_proxies(
                 for line in raw_lines:
                     p = parse_proxy(line)
                     if p:
-                        proxies.append(p)
+                        file_proxies.append(p)
+    
+    # Combine: public proxies first (already validated), then file proxies
+    all_proxies = proxies + file_proxies
     
     # Create enhanced pool
     pool = EnhancedProxyPool(
-        initial_proxies=proxies,
+        initial_proxies=all_proxies,
         min_threshold=min_threshold,
         target_size=target_size,
         raw_file=target_path,
