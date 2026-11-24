@@ -10,7 +10,7 @@ Supports:
 import time
 import random
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 KNOWN_OUO_DOMAINS = ["ouo.io", "ouo.press"]
@@ -18,6 +18,26 @@ KNOWN_OUO_DOMAINS = ["ouo.io", "ouo.press"]
 KNOWN_FAST_SHORTENERS = [
     "bit.ly", "tinyurl.com", "cutt.ly", "is.gd", "v.gd", "t.co", "rb.gy", "shorturl.at"
 ]
+
+# Exact registrable domains (subdomains allowed via endswith("." + d)).
+# NOTE: never use substring matching here - "t.co" is a substring of
+# "target.com" / "project.com" / "art.com" and would flag real destinations.
+KNOWN_SHORTENER_DOMAINS = {
+    "ouo.io", "ouo.press",
+    "bit.ly", "tinyurl.com", "cutt.ly", "is.gd", "v.gd", "t.co", "rb.gy",
+    "shorturl.at", "ow.ly", "buff.ly", "rebrand.ly",
+    "droplink.co", "droplink.in",
+    "gplinks.in", "gplinks.co", "gplinks.com",
+    "shrinkme.io", "shrinkme.ink", "shrinke.me",
+    "shareus.io", "shareus.in",
+    "linkvertise.com", "linkvertise.net",
+    "adf.ly", "adfly.com",
+    "za.gl", "za.gg", "mdisk.me",
+}
+
+def domain_matches(domain: str, known: str) -> bool:
+    """True only when domain is exactly `known` or a subdomain of it."""
+    return domain == known or domain.endswith("." + known)
 
 def simulate_human_behavior(page, duration_s: float = None, is_mobile: bool = None):
     """
@@ -172,12 +192,27 @@ def is_shortener(url: str) -> bool:
     if not path or path in ["index.html", "index.php"]:
         return False
 
-    shortener_indicators = [
-        "ouo.io", "ouo.press", "bit.ly", "tinyurl.com", "cutt.ly",
-        "is.gd", "v.gd", "t.co", "rb.gy", "droplink", "gplinks",
-        "shrinkme", "shareus", "linkvertise", "adfly"
-    ]
-    return any(ind in domain for ind in shortener_indicators)
+    return any(domain_matches(domain, d) for d in KNOWN_SHORTENER_DOMAINS)
+
+def proxy_url_with_auth(proxy: dict):
+    """Build an http(s)://user:pass@host:port URL. Returns None for socks
+    (urllib cannot tunnel through socks without PySocks)."""
+    if not proxy or not proxy.get("server"):
+        return None
+    server = proxy["server"]
+    if server.startswith("socks"):
+        return None
+    scheme, sep, rest = server.partition("://")
+    if not sep:
+        scheme, rest = "http", server
+    user = proxy.get("username")
+    if not user:
+        return f"{scheme}://{rest}"
+    auth = quote(str(user), safe="")
+    if proxy.get("password") is not None:
+        auth += ":" + quote(str(proxy["password"]), safe="")
+    return f"{scheme}://{auth}@{rest}"
+
 
 def try_fast_http_resolve(url: str, proxy: dict = None, timeout: int = 5) -> str:
     """
@@ -186,13 +221,20 @@ def try_fast_http_resolve(url: str, proxy: dict = None, timeout: int = 5) -> str
     """
     parsed = urlparse(url)
     domain = parsed.netloc.lower()
-    if any(fs in domain for fs in KNOWN_FAST_SHORTENERS):
+    if any(domain_matches(domain, fs) for fs in KNOWN_FAST_SHORTENERS):
+        # If a proxy was requested but cannot be used by urllib, do NOT fall
+        # back to a direct connection (that would leak the real IP).
+        purl = None
+        if proxy:
+            purl = proxy_url_with_auth(proxy)
+            if not purl:
+                return None
         try:
             handlers = []
-            if proxy and "server" in proxy:
+            if purl:
                 handlers.append(urllib.request.ProxyHandler({
-                    "http": proxy["server"],
-                    "https": proxy["server"]
+                    "http": purl,
+                    "https": purl
                 }))
             opener = urllib.request.build_opener(*handlers)
             req = urllib.request.Request(

@@ -100,7 +100,9 @@ def validate_http(raw_proxy, timeout=3.0):
     try:
         h = urllib.request.ProxyHandler({"http": raw_proxy, "https": raw_proxy})
         opener = urllib.request.build_opener(h)
-        req = urllib.request.Request("http://checkip.amazonaws.com", headers={"User-Agent": "Mozilla/5.0"})
+        # https endpoint: many proxies tunnel 443 only, so plain HTTP gave
+        # false negatives for otherwise working proxies.
+        req = urllib.request.Request("https://checkip.amazonaws.com", headers={"User-Agent": "Mozilla/5.0"})
         with opener.open(req, timeout=timeout) as resp:
             if resp.status == 200:
                 return True
@@ -110,12 +112,19 @@ def validate_http(raw_proxy, timeout=3.0):
 
 def test_proxy(proxy_entry):
     t0 = time.time()
-    if proxy_entry.startswith("socks5://"):
-        target = proxy_entry.replace("socks5://", "")
-        host, port = target.split(":")
-        ok = validate_socks5(host, port, timeout=2.0)
-    else:
-        ok = validate_http(proxy_entry, timeout=2.5)
+    try:
+        if proxy_entry.startswith("socks5://"):
+            target = proxy_entry[len("socks5://"):]
+            if "@" in target:          # strip credentials
+                target = target.split("@")[-1]
+            host, _, port = target.partition(":")
+            if not host or not port:
+                return None
+            ok = validate_socks5(host, port, timeout=2.0)
+        else:
+            ok = validate_http(proxy_entry, timeout=2.5)
+    except Exception:
+        return None
 
     if ok:
         latency = round((time.time() - t0) * 1000)
@@ -148,46 +157,53 @@ def main():
     valid_proxies = []
     seen_ips = set()
 
-    # Clear old proxies file immediately
-    with open(PROXIES_TXT, "w", encoding="utf-8") as f_act, open(CLEAN_PROXIES_TXT, "w", encoding="utf-8") as f_cln:
-        f_act.flush()
-        f_cln.flush()
+    batch_size = 500
+    for i in range(0, len(candidates), batch_size):
+        if len(valid_proxies) >= target_count:
+            break
 
-        batch_size = 500
-        for i in range(0, len(candidates), batch_size):
-            if len(valid_proxies) >= target_count:
-                break
+        batch = candidates[i:i + batch_size]
+        t_batch0 = time.time()
 
-            batch = candidates[i:i + batch_size]
-            t_batch0 = time.time()
+        with ThreadPoolExecutor(max_workers=80) as executor:
+            futs = [executor.submit(test_proxy, c) for c in batch]
+            for f in as_completed(futs):
+                res = f.result()
+                if res:
+                    p, lat = res
+                    ip = p.split("://")[-1].split(":")[0]
+                    if ip not in seen_ips:
+                        seen_ips.add(ip)
+                        valid_proxies.append(p)
+                        print(f"   🎯 [{len(valid_proxies):3d}/{target_count}] Live ({lat:4d}ms): {p}")
 
-            with ThreadPoolExecutor(max_workers=80) as executor:
-                futs = [executor.submit(test_proxy, c) for c in batch]
-                for f in as_completed(futs):
-                    res = f.result()
-                    if res:
-                        p, lat = res
-                        ip = p.split("://")[-1].split(":")[0]
-                        if ip not in seen_ips:
-                            seen_ips.add(ip)
-                            valid_proxies.append(p)
-                            f_act.write(f"{p}\n")
-                            f_act.flush()
-                            f_cln.write(f"{p}\n")
-                            f_cln.flush()
-                            print(f"   🎯 [{len(valid_proxies):3d}/{target_count}] Live ({lat:4d}ms): {p}")
+                        if len(valid_proxies) >= target_count:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            break
 
-                            if len(valid_proxies) >= target_count:
-                                executor.shutdown(wait=False, cancel_futures=True)
-                                break
+        t_elapsed = round(time.time() - t_batch0, 1)
+        print(f"   ℹ️ Batch [{i//batch_size + 1}] processed {len(batch)} candidates in {t_elapsed}s | Live so far: {len(valid_proxies)}")
 
-            t_elapsed = round(time.time() - t_batch0, 1)
-            print(f"   ℹ️ Batch [{i//batch_size + 1}] processed {len(batch)} candidates in {t_elapsed}s | Live so far: {len(valid_proxies)}")
+    # Only touch the output files after validation, and never wipe a good list
+    # when zero proxies were found. Write to a temp file, then replace.
+    if valid_proxies:
+        for path in (PROXIES_TXT, CLEAN_PROXIES_TXT):
+            tmp = path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    for p in valid_proxies:
+                        f.write(f"{p}\n")
+                os.replace(tmp, path)
+            except Exception:
+                pass
+    else:
+        print("⚠️ No live proxies found - existing proxy files left untouched.")
 
     print("\n" + "=" * 65)
     print(f"🎉 Validation Complete! Total verified working proxies: {len(valid_proxies)}")
-    print(f"💾 Written to: {PROXIES_TXT}")
-    print(f"💾 Written to: {CLEAN_PROXIES_TXT}")
+    if valid_proxies:
+        print(f"💾 Written to: {PROXIES_TXT}")
+        print(f"💾 Written to: {CLEAN_PROXIES_TXT}")
     print("=" * 65)
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import time
 import threading
 import subprocess
 import re
+import signal
 from rich.console import Console
 from rich.layout import Layout
 from rich.panel import Panel
@@ -45,6 +46,15 @@ class OUOTUI:
         self.max_logs = 20
         self.total_links = 0
         self.processed_links = 0
+        self.last_result = ""
+
+        # Settings (passed to the resolver subprocess)
+        self.proxy_mode = "direct"      # direct | public | file
+        self.proxy_file = "proxies.txt"
+        self.device = "auto"            # auto/android/ios/mobile/desktop
+        self.timeout = 12
+        self.clean = False
+        self.output_file = "impressions.txt"
 
         # Thread communication
         self.menu_choice = None
@@ -93,9 +103,9 @@ class OUOTUI:
         table.add_row("✅ Success", str(self.success_count))
         table.add_row("❌ Failed", str(self.fail_count))
         table.add_row("⚠️ Expired", str(self.expired_count))
-        table.add_row("🔗 Total Links", str(self.total_links))
-        table.add_row("📦 Processed", str(self.processed_links))
+        table.add_row("📦 Progress", f"{self.processed_links}/{self.total_links}")
         table.add_row("🔄 Round", f"{self.current_round}/{self.total_rounds or '∞'}")
+        table.add_row("🛡️ Proxy", self.proxy_mode)
         table.add_row("📊 Status", self.status)
         table.add_row("🔇 Quiet", "ON" if self.quiet_mode else "OFF")
 
@@ -133,6 +143,8 @@ class OUOTUI:
         menu.add_row("2", "Scrape Proxies")
         menu.add_row("3", "Other Functions")
         menu.add_row("4", "Toggle Quiet Mode")
+        menu.add_row("5", "Settings")
+        menu.add_row("S", "Stop current task")
         menu.add_row("Q", "Quit")
 
         return Panel(
@@ -172,7 +184,6 @@ class OUOTUI:
 
         # Add to logs (non-quiet mode)
         if not self.quiet_mode:
-            # Determine log level from content
             if "✅" in line or "SUCCESS" in line or "👉 Final Destination" in line:
                 self.add_log(line, "success")
             elif "❌" in line or "FAILED" in line or "Could not resolve" in line or "Error" in line:
@@ -200,25 +211,22 @@ class OUOTUI:
             self.current_round = int(round_match.group(1))
             self.status = f"Round {self.current_round} running..."
 
-        # Parse round complete with stats
+        # Round complete: only update status/round. Counters come from the
+        # per-link lines below, so nothing is double-counted.
         complete_match = re.search(r"ROUND\s+(\d+)\s+COMPLETE.*?Success:\s*(\d+)/(\d+)", line)
         if complete_match:
             self.current_round = int(complete_match.group(1))
-            success = int(complete_match.group(2))
-            total = int(complete_match.group(3))
-            self.success_count += success
-            self.fail_count += (total - success)
-            self.processed_links += total
             self.status = f"Round {self.current_round} complete"
 
-        # Parse individual link results
+        # Live per-link progress (each link prints exactly one of these).
         if "👉 Final Destination:" in line:
             self.success_count += 1
             self.processed_links += 1
+            self.last_result = line.split("👉 Final Destination:", 1)[-1].strip()
         elif "❌ Could not resolve destination" in line:
             self.fail_count += 1
             self.processed_links += 1
-        elif "EXPIRED / DELETED" in line:
+        elif "Status: EXPIRED / DELETED" in line:
             self.expired_count += 1
             self.processed_links += 1
 
@@ -237,6 +245,21 @@ class OUOTUI:
         if "OVERALL AUTOMATION SESSION SUMMARY" in line:
             self.status = "Complete"
 
+    # ---------- Process control ----------
+    def stop_worker(self):
+        """Stop the worker subprocess AND its Chromium children (process group),
+        so no headless browsers are left running."""
+        p = self.worker_proc
+        if not p:
+            return
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
     # ---------- Background Workers ----------
     def run_resolver_subprocess(self, rounds: int, concurrency: int = 2):
         """Worker: run CLI as subprocess and capture output in real-time"""
@@ -246,14 +269,24 @@ class OUOTUI:
         self.fail_count = 0
         self.expired_count = 0
         self.processed_links = 0
+        self.last_result = ""
         self.status = "Starting..."
         self.add_log(f"Starting resolver: {rounds} rounds, concurrency={concurrency}", "success")
 
         try:
-            # Build command
-            cmd = [sys.executable, "main.py", "--once", "-c", str(concurrency)]
+            # Build command (-u = unbuffered so logs stream in real-time)
+            cmd = [sys.executable, "-u", "main.py", "-c", str(concurrency)]
             if rounds > 1:
                 cmd.extend(["--rounds", str(rounds)])
+            if self.proxy_mode == "public":
+                cmd.append("-P")
+            elif self.proxy_mode == "file":
+                cmd.extend(["--proxy-file", self.proxy_file])
+            cmd.extend(["--device", self.device, "--timeout", str(self.timeout)])
+            if self.output_file:
+                cmd.extend(["-o", self.output_file])
+            if self.clean:
+                cmd.append("--clean")
 
             self.worker_proc = subprocess.Popen(
                 cmd,
@@ -262,30 +295,32 @@ class OUOTUI:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
+                start_new_session=True,   # own process group -> clean stop
             )
 
             # Read output line by line in real-time
             if self.worker_proc and self.worker_proc.stdout:
                 for line in iter(self.worker_proc.stdout.readline, ''):
                     if not self.running:
-                        self.worker_proc.terminate()
+                        self.stop_worker()
                         break
                     self.parse_output_line(line)
 
-            self.worker_proc.wait()
-            
+            rc = self.worker_proc.wait()
             if self.running:
-                self.status = "Complete"
-                self.add_log("Resolver finished", "success")
+                if rc == 0:
+                    self.status = "Complete"
+                    self.add_log("Resolver finished", "success")
+                else:
+                    self.status = f"Failed (exit {rc})"
+                    self.add_log(f"Resolver failed with exit code {rc}", "error")
 
         except Exception as e:
             self.status = "Error"
             self.add_log(f"Error: {e}", "error")
         finally:
             self.worker_proc = None
-            self.total_rounds = 0
-            self.current_round = 0
 
     def scrape_proxies_subprocess(self):
         """Worker: fetch proxies via subprocess"""
@@ -293,7 +328,7 @@ class OUOTUI:
         self.add_log("Scraping proxies from hide.mn...", "warning")
 
         try:
-            cmd = [sys.executable, "main.py", "--fetch-proxies"]
+            cmd = [sys.executable, "-u", "main.py", "--fetch-proxies"]
             self.worker_proc = subprocess.Popen(
                 cmd,
                 cwd=SCRIPT_DIR,
@@ -301,27 +336,30 @@ class OUOTUI:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                universal_newlines=True
+                universal_newlines=True,
+                start_new_session=True,
             )
 
-            # Read output line by line in real-time
             if self.worker_proc and self.worker_proc.stdout:
                 for line in iter(self.worker_proc.stdout.readline, ''):
                     if not self.running:
-                        self.worker_proc.terminate()
+                        self.stop_worker()
                         break
                     self.parse_output_line(line)
 
-            self.worker_proc.wait()
-            self.worker_proc = None
-            
+            rc = self.worker_proc.wait()
             if self.running:
-                self.status = "Idle"
-                self.add_log(f"Scraping done. Proxies: {self.proxy_count}", "success")
+                if rc == 0:
+                    self.status = "Idle"
+                    self.add_log(f"Scraping done. Proxies: {self.proxy_count}", "success")
+                else:
+                    self.status = f"Scrape failed (exit {rc})"
+                    self.add_log(f"Scraping failed with exit code {rc}", "error")
 
         except Exception as e:
             self.add_log(f"Scrape error: {e}", "error")
             self.status = "Idle"
+        finally:
             self.worker_proc = None
 
     def show_other_functions(self):
@@ -340,57 +378,103 @@ class OUOTUI:
         self.quiet_mode = not self.quiet_mode
         self.add_log(f"Quiet mode: {'ON' if self.quiet_mode else 'OFF'}", "warning")
 
+    # ---------- Settings ----------
+    def settings_wizard(self):
+        """Interactive settings (Enter keeps the current value). Runs in the
+        single input thread, so it never races the menu reader."""
+        console.print("[bold cyan]Settings (Enter = keep current)[/bold cyan]")
+
+        mode = console.input(f"Proxy mode [direct/public/file] ({self.proxy_mode}): ").strip().lower()
+        if mode in ("direct", "public", "file"):
+            self.proxy_mode = mode
+        if self.proxy_mode == "file":
+            pf = console.input(f"Proxy file ({self.proxy_file}): ").strip()
+            if pf:
+                self.proxy_file = pf
+
+        dev = console.input(f"Device [auto/android/ios/mobile/desktop] ({self.device}): ").strip().lower()
+        if dev in ("auto", "android", "ios", "mobile", "desktop"):
+            self.device = dev
+
+        to = console.input(f"Timeout sec ({self.timeout}): ").strip()
+        if to.isdigit():
+            self.timeout = max(1, int(to))
+
+        of = console.input(f"Output file ({self.output_file}): ").strip()
+        if of:
+            self.output_file = of
+
+        cl = console.input(f"Prune expired links from input? [y/n] ({'y' if self.clean else 'n'}): ").strip().lower()
+        if cl in ("y", "yes"):
+            self.clean = True
+        elif cl in ("n", "no"):
+            self.clean = False
+
+        self.add_log(
+            f"Settings: proxy={self.proxy_mode}, device={self.device}, "
+            f"timeout={self.timeout}, clean={self.clean}, out={self.output_file}",
+            "success",
+        )
+
     # ---------- Input Threads ----------
     def input_thread(self):
-        """Background thread: read menu choice via console.input()"""
+        """Single stdin reader: menu choice AND all prompts happen here, so
+        two threads can never race for the same input line."""
         while self.running:
             try:
-                choice = console.input("\n[bold bright_cyan]Select (1-4, Q):[/bold bright_cyan] ").strip()
-                self.menu_choice = choice.upper()
+                choice = console.input("\n[bold bright_cyan]Select (1-5, S, Q):[/bold bright_cyan] ").strip().upper()
             except (EOFError, KeyboardInterrupt):
                 self.menu_choice = "Q"
                 break
             except Exception:
                 time.sleep(0.1)
+                continue
 
-    def rounds_prompt_thread(self):
-        """Background thread: prompt for rounds count and concurrency"""
-        try:
-            rounds = IntPrompt.ask("\n[bold]How many rounds?[/bold]", default=1)
-            if rounds > 0:
-                concurrency = IntPrompt.ask("[bold]Concurrency (1-4)?[/bold]", default=2)
-                concurrency = max(1, min(concurrency, 4))
-                self.rounds_input = (rounds, concurrency)
-        except Exception:
-            self.rounds_input = None
+            if choice == "1":
+                try:
+                    rounds = IntPrompt.ask("[bold]How many rounds?[/bold]", default=1)
+                    if rounds > 0:
+                        concurrency = IntPrompt.ask("[bold]Concurrency (1-4)?[/bold]", default=2)
+                        concurrency = max(1, min(concurrency, 4))
+                        self.rounds_input = (rounds, concurrency)
+                        self.menu_choice = "1"
+                except (EOFError, KeyboardInterrupt):
+                    self.menu_choice = "Q"
+                    break
+                except Exception:
+                    self.rounds_input = None
+                continue
+
+            if choice == "5":
+                try:
+                    self.settings_wizard()
+                except (EOFError, KeyboardInterrupt):
+                    self.menu_choice = "Q"
+                    break
+                except Exception:
+                    pass
+                continue
+
+            self.menu_choice = choice
 
     # ---------- Main Loop ----------
     def handle_choice(self, choice: str):
         """Process menu selection"""
         if choice == "1":
-            # Stop any running worker
-            if self.worker_proc:
-                self.worker_proc.terminate()
-                self.worker_proc = None
-            
-            # Prompt for rounds and concurrency
-            t = threading.Thread(target=self.rounds_prompt_thread, daemon=True)
-            t.start()
-            t.join(timeout=30)
+            self.stop_worker()
+            # Rounds/concurrency were already collected by input_thread.
             if self.rounds_input:
                 rounds, concurrency = self.rounds_input
                 self.worker_thread = threading.Thread(
-                    target=self.run_resolver_subprocess, 
-                    args=(rounds, concurrency), 
+                    target=self.run_resolver_subprocess,
+                    args=(rounds, concurrency),
                     daemon=True
                 )
                 self.worker_thread.start()
             self.rounds_input = None
 
         elif choice == "2":
-            if self.worker_proc:
-                self.worker_proc.terminate()
-                self.worker_proc = None
+            self.stop_worker()
             threading.Thread(target=self.scrape_proxies_subprocess, daemon=True).start()
 
         elif choice == "3":
@@ -399,15 +483,19 @@ class OUOTUI:
         elif choice == "4":
             self.toggle_quiet()
 
+        elif choice == "S":
+            self.stop_worker()
+            self.status = "Stopped"
+            self.add_log("Stopped by user", "warning")
+
         elif choice == "Q":
-            if self.worker_proc:
-                self.worker_proc.terminate()
+            self.stop_worker()
             self.running = False
 
     def run(self):
         """Main TUI loop"""
         self.add_log("OUO Link Resolver TUI started", "success")
-        self.add_log("Press 1-4 or Q to quit", "info")
+        self.add_log("Press 1-5, S or Q", "info")
 
         # Start input thread
         threading.Thread(target=self.input_thread, daemon=True).start()

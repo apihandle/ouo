@@ -4,7 +4,7 @@
 ```bash
 python3 setup.py
 ```
-Installs Playwright, Chromium, and dependencies.
+Installs Playwright, Rich (TUI), Chromium, and dependencies.
 
 ## Usage
 ```bash
@@ -52,17 +52,20 @@ Scrapes 12,000+ proxies from hide.mn/global feeds, saves to `proxies_raw.txt` (n
 ## Options
 | Flag | Description |
 |------|-------------|
-| `--once` | Single run (default: infinite loop) |
+| `--once` | Single run and exit |
+| `--loop` | Infinite loop |
+| `--rounds N` | Run N rounds then exit |
 | `-c, --concurrency N` | Parallel workers (1-4, default: 3) |
 | `-f, --file FILE` | Input file (default: links.txt) |
 | `-o, --output FILE` | Output file (default: impressions.txt) |
 | `-P, --public-proxies` | Auto-scrape & validate public proxies |
 | `--proxy-file FILE` | Use your own proxy list |
 | `--device auto|android|ios|mobile|desktop` | Device profile (default: auto) |
-| `--timeout SEC` | Page load timeout (default: 30) |
+| `--timeout SEC` | Page load timeout (default: 12) |
 | `--clean` | Auto-remove dead links from input file |
 
 ## Notes
 - **Public proxies only work for simple redirects** (TinyURL, Bitly, etc.)
 - **OUO, GPLinks, Droplink, Linkvertise need residential/mobile IPs** — public proxies will fail
+- Without `--once`, `--loop` or `--rounds`, one single round runs by default
 - Output saved to `impressions.txt` (final destinations)

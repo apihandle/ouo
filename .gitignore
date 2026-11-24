@@ -1,7 +1,12 @@
 __pycache__/
 *.pyc
+*.bak
 proxies.txt
 proxies_raw.txt
 impressions.txt
+clean_proxies.txt
+resolved.txt
+multi_test.txt
 test_links.txt
+test_clean.txt
 *.log
