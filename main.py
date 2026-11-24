@@ -357,7 +357,12 @@ def resolve_single_link(browser, item, proxy_list=None, timeout_sec=30,
                         safe_print(f"[{idx}/{total}] ⚠️ Status: EXPIRED / DELETED (No longer active on OUO)\n")
                     else:
                         safe_print(f"[{idx}/{total}] 👉 Final Destination: {final_destination}\n")
-                    return final_destination, working_proxy
+                    return {
+                        "index": idx,
+                        "input_url": raw_url,
+                        "destination": final_destination,
+                        "status": "EXPIRED" if expired else "SUCCESS"
+                    }, working_proxy
                 
                 safe_print(f"[{idx}/{total}] ⚠️ Proxy worked but resolution failed, trying next...")
                 proxy_list.report_failure(proxy, "resolution failed", is_ouo=is_ouo)
@@ -372,7 +377,12 @@ def resolve_single_link(browser, item, proxy_list=None, timeout_sec=30,
                 safe_print(f"[{idx}/{total}] 🛡️  Using validated proxy: {proxy['display']}")
                 final_destination, working_proxy = run_with_proxy(proxy)
                 if final_destination:
-                    return final_destination, working_proxy
+                    return {
+                        "index": idx,
+                        "input_url": raw_url,
+                        "destination": final_destination,
+                        "status": "EXPIRED" if final_destination == "[EXPIRED / DELETED LINK]" else "SUCCESS"
+                    }, working_proxy
                 safe_print(f"[{idx}/{total}] ⚠️ Proxy worked but resolution failed, trying next...")
                 proxy_list.report_failure(proxy, "resolution failed")
                 # Try next proxy from pool
@@ -398,7 +408,12 @@ def resolve_single_link(browser, item, proxy_list=None, timeout_sec=30,
                     safe_print(f"[{idx}/{total}] ✅ Proxy validated, using it")
                     final_destination, working_proxy = run_with_proxy(proxy)
                     if final_destination:
-                        return final_destination, working_proxy
+                        return {
+                            "index": idx,
+                            "input_url": raw_url,
+                            "destination": final_destination,
+                            "status": "EXPIRED" if final_destination == "[EXPIRED / DELETED LINK]" else "SUCCESS"
+                        }, working_proxy
                     safe_print(f"[{idx}/{total}] ⚠️ Proxy worked but resolution failed, trying next...")
                 else:
                     safe_print(f"[{idx}/{total}] ❌ Proxy dead, trying next...")
